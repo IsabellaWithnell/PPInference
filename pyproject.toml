@@ -1,0 +1,60 @@
+[build-system]
+requires = [
+  "hatchling>=1.24",
+  "hatch-vcs>=0.4",
+]
+build-backend = "hatchling.build"
+
+[project]
+name            = "mini_bayes_ppi"
+description     = "Bayesian multi‑task PPI inference from single‑cell RNA‑seq counts"
+readme          = "README.md"
+license         = {text = "MIT"}
+requires-python = ">=3.9"
+authors         = [
+  {name = "Isabella Withnell"},
+]
+keywords        = ["bioinformatics", "ppi", "bayesian", "single‑cell", "torch", "pyro"]
+classifiers     = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+  "anndata>=0.10",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scipy>=1.11",
+  "torch>=2.1",
+  "pyro-ppl>=1.9",
+]
+
+dynamic = ["version"]
+
+[project.optional-dependencies]
+"test" = [
+  "pytest>=8.0",
+  "ruff>=0.4",
+]
+
+[project.urls]
+Homepage        = "https://github.com/IsabellaWithnell/mini_bayes_ppi"
+Documentation   = "https://mini-bayes-ppi.readthedocs.io"
+Source          = "https://github.com/IsabellaWithnell/mini_bayes_ppi"
+Issues          = "https://github.com/IsabellaWithnell/mini_bayes_ppi/issues"
+
+[tool.hatch.version]
+source          = "vcs"
+
+[tool.ruff]
+line-length     = 100
+select          = ["E", "F", "I", "UP", "B", "C4"]
+
+[tool.pytest.ini_options]
+addopts         = "-q"
+pythonpath      = ["src"]
