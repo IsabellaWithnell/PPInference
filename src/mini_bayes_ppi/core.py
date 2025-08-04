@@ -94,7 +94,8 @@ class MBModel:
         with pyro.plate("cell_types", self.n_types):
             with pyro.plate("edges_phi", self.n_edges):
                 phi = pyro.sample("phi", dist.Normal(0.0, 0.2))  # Slightly larger cell-type effects
-        
+        phi = phi.T
+
         # Gene-specific baseline expression
         with pyro.plate("genes_bias", self.n_genes):
             bias = pyro.sample("bias", dist.Normal(0.0, 1.0))
