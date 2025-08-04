@@ -31,9 +31,11 @@ def load_string_prior(
             if a in name_to_ix and b in name_to_ix:
                 edges.append((name_to_ix[a], name_to_ix[b]))
         return edges
+    
     if isinstance(tsv_or_taxid, int):
         raise NotImplementedError("Automatic STRING download not implemented yet.")
 
+    # Handle TSV file path
     path = Path(tsv_or_taxid).expanduser()
     df = pd.read_csv(path, sep="\t")
     df = df[df["combined_score"] >= score_cutoff]
@@ -42,22 +44,6 @@ def load_string_prior(
     edges = [
         (name_to_ix[a], name_to_ix[b])
         for a, b in zip(df["protein1"], df["protein2"])
-
-
-
-
-import numpy as np
-import anndata as ad
-import anndata as ad
-import numpy as np
-import pandas as pd
-import torch
-import torch
-import pyro
-
-
-from mini_bayes_ppi import MBModel
-from mini_bayes_ppi import MBModel, load_string_prior
-from mini_bayes_ppi.core import _edge_index
-
-
+        if a in name_to_ix and b in name_to_ix
+    ]
+    return edges
