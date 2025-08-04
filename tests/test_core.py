@@ -1,10 +1,11 @@
 
-import numpy as np
 import anndata as ad
+import numpy as np
+import pandas as pd
 import torch
-import pyro
 
-from mini_bayes_ppi import MBModel
+from mini_bayes_ppi import MBModel, load_string_prior
+from mini_bayes_ppi.core import _edge_index
 
 
 def test_elbo_decreases():
@@ -23,3 +24,29 @@ def test_elbo_decreases():
 
     assert loss1 < loss0, "ELBO did not improve"
     assert not torch.isnan(torch.tensor(loss1)), "ELBO NaN detected"
+
+
+def test_load_string_prior_list():
+    names = ["A", "B", "C", "D"]
+    edges = load_string_prior(["A B", ("C", "D")], adata_var_names=names)
+    assert edges == [(0, 1), (2, 3)]
+
+
+def test_load_string_prior_tsv(tmp_path):
+    df = pd.DataFrame(
+        {
+            "protein1": ["A", "C"],
+            "protein2": ["B", "D"],
+            "combined_score": [800, 400],
+        }
+    )
+    path = tmp_path / "prior.tsv"
+    df.to_csv(path, sep="\t", index=False)
+    edges = load_string_prior(str(path), adata_var_names=["A", "B", "C", "D"], score_cutoff=500)
+    assert edges == [(0, 1)]
+
+
+def test_edge_index_symmetry():
+    idx = _edge_index(3, [(0, 1)])
+    expected = torch.tensor([[0, 1], [1, 0]])
+    assert torch.equal(idx, expected)
