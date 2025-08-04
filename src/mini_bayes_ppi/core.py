@@ -71,8 +71,8 @@ class MBModel:
         self._build_model()
 
     # -------------------- model --------------------
-class MBModel:
-        with pyro.plate("genes", self.n_genes):
+def _model(self, xs: torch.Tensor, ct: torch.Tensor, log_lib: torch.Tensor) -> None:
+    with pyro.plate("genes", self.n_genes)
             r = pyro.sample("r", dist.Gamma(2.0, 0.1))
         r = r.unsqueeze(0).expand(xs.shape[0], -1)
 
