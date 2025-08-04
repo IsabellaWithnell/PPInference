@@ -42,9 +42,7 @@ def load_string_prior(
     edges = [
         (name_to_ix[a], name_to_ix[b])
         for a, b in zip(df["protein1"], df["protein2"])
-tests/test_core.py
-+30
--3
+
 
 
 
