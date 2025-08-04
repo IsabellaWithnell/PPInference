@@ -46,17 +46,19 @@ class MBModel:
         self.ctypes: list[str] = list(adata.obs[cell_key].astype(str).unique())
         self.n_types = len(self.ctypes)
         ct_lookup: dict[str, int] = {c: i for i, c in enumerate(self.ctypes)}
+        
+        # Fix 1: Proper indentation and device placement
         self.ct_idx = torch.tensor(
             [ct_lookup[c] for c in adata.obs[cell_key].astype(str)],
             dtype=torch.long,
-            
+            device=self.device
         )
 
         self.edge_idx = _edge_index(self.n_genes, list(prior_edges)).to(self.device)
         self.n_edges = self.edge_idx.shape[1]
 
         x = torch.tensor(adata.X.A if hasattr(adata.X, "A") else adata.X, dtype=torch.float32)
-        self.X = x
+        self.X = x.to(self.device)  # Also move X to device
 
         libsize = torch.sum(self.X, dim=1, keepdim=True) + 1.0
         self.log_lib = libsize.log()
@@ -70,66 +72,66 @@ class MBModel:
 
         self._build_model()
 
-    # -------------------- model --------------------
-def _model(self, xs: torch.Tensor, ct: torch.Tensor, log_lib: torch.Tensor) -> None:
-    """Complete Bayesian generative model for PPI inference.
-    
-    Args:
-        xs: Gene expression counts (batch_size, n_genes)
-        ct: Cell type indices (batch_size,)
-        log_lib: Library size normalization (batch_size, 1)
-    """
-    
-    # Global edge interaction probabilities (do interactions exist?)
-    with pyro.plate("edges", self.n_edges):
-        theta = pyro.sample("theta", dist.Beta(1.0, 9.0))  # ~10% prior interaction prob
-    
-    # Global edge interaction strengths (how strong are interactions?)
-    with pyro.plate("edges_tau", self.n_edges):
-        tau = pyro.sample("tau", dist.Normal(0.0, 0.5))  # Moderate interaction strengths
-    
-    # Cell type-specific modulation of interactions
-    with pyro.plate("cell_types", self.n_types):
-        with pyro.plate("edges_phi", self.n_edges):
-            phi = pyro.sample("phi", dist.Normal(0.0, 0.2))  # Slightly larger cell-type effects
-    
-    # Gene-specific baseline expression
-    with pyro.plate("genes_bias", self.n_genes):
-        bias = pyro.sample("bias", dist.Normal(0.0, 1.0))
-    
-    # Negative binomial dispersion
-    with pyro.plate("genes_r", self.n_genes):
-        r = pyro.sample("r", dist.Gamma(2.0, 0.1))
-    r = r.unsqueeze(0).expand(xs.shape[0], -1)
+    # Fix 2: Move _model method inside the class with proper indentation
+    def _model(self, xs: torch.Tensor, ct: torch.Tensor, log_lib: torch.Tensor) -> None:
+        """Complete Bayesian generative model for PPI inference.
+        
+        Args:
+            xs: Gene expression counts (batch_size, n_genes)
+            ct: Cell type indices (batch_size,)
+            log_lib: Library size normalization (batch_size, 1)
+        """
+        
+        # Global edge interaction probabilities (do interactions exist?)
+        with pyro.plate("edges", self.n_edges):
+            theta = pyro.sample("theta", dist.Beta(1.0, 9.0))  # ~10% prior interaction prob
+        
+        # Global edge interaction strengths (how strong are interactions?)
+        with pyro.plate("edges_tau", self.n_edges):
+            tau = pyro.sample("tau", dist.Normal(0.0, 0.5))  # Moderate interaction strengths
+        
+        # Cell type-specific modulation of interactions
+        with pyro.plate("cell_types", self.n_types):
+            with pyro.plate("edges_phi", self.n_edges):
+                phi = pyro.sample("phi", dist.Normal(0.0, 0.2))  # Slightly larger cell-type effects
+        
+        # Gene-specific baseline expression
+        with pyro.plate("genes_bias", self.n_genes):
+            bias = pyro.sample("bias", dist.Normal(0.0, 1.0))
+        
+        # Negative binomial dispersion
+        with pyro.plate("genes_r", self.n_genes):
+            r = pyro.sample("r", dist.Gamma(2.0, 0.1))
+        r = r.unsqueeze(0).expand(xs.shape[0], -1)
 
-    # Cell type-specific interaction weights
-    phi_batch = phi[ct]  # Shape: (batch_size, n_edges)
-    W_edges = theta * (tau + phi_batch)  # Shape: (batch_size, n_edges)
-    
-    # Apply edge interactions (vectorized for speed)
-    i, j = self.edge_idx
-    
-    # Compute interaction effects for all edges at once
-    interaction_effects_i = xs[:, j] * W_edges  # Gene j -> Gene i
-    interaction_effects_j = xs[:, i] * W_edges  # Gene i -> Gene j
-    
-    # Accumulate effects using scatter_add for efficiency
-    Wx = torch.zeros_like(xs)
-    Wx.scatter_add_(1, i.unsqueeze(0).expand(xs.shape[0], -1), interaction_effects_i)
-    Wx.scatter_add_(1, j.unsqueeze(0).expand(xs.shape[0], -1), interaction_effects_j)
-    
-    # Optional: Add numerical stability
-    Wx = torch.clamp(Wx, min=-10, max=10)  # Prevent extreme values
-    
-    # Compute log rates
-    logits = log_lib + bias + Wx
-    
-    # Likelihood
-    pyro.sample(
-        "obs",
-        dist.NegativeBinomial(total_count=r, logits=logits).to_event(1),
-        obs=xs,
-    )
+        # Cell type-specific interaction weights
+        phi_batch = phi[ct]  # Shape: (batch_size, n_edges)
+        W_edges = theta * (tau + phi_batch)  # Shape: (batch_size, n_edges)
+        
+        # Apply edge interactions (vectorized for speed)
+        i, j = self.edge_idx
+        
+        # Compute interaction effects for all edges at once
+        interaction_effects_i = xs[:, j] * W_edges  # Gene j -> Gene i
+        interaction_effects_j = xs[:, i] * W_edges  # Gene i -> Gene j
+        
+        # Accumulate effects using scatter_add for efficiency
+        Wx = torch.zeros_like(xs)
+        Wx.scatter_add_(1, i.unsqueeze(0).expand(xs.shape[0], -1), interaction_effects_i)
+        Wx.scatter_add_(1, j.unsqueeze(0).expand(xs.shape[0], -1), interaction_effects_j)
+        
+        # Optional: Add numerical stability
+        Wx = torch.clamp(Wx, min=-10, max=10)  # Prevent extreme values
+        
+        # Compute log rates
+        logits = log_lib + bias + Wx
+        
+        # Likelihood
+        pyro.sample(
+            "obs",
+            dist.NegativeBinomial(total_count=r, logits=logits).to_event(1),
+            obs=xs,
+        )
 
     def _build_model(self) -> None:
         self.guide = AutoNormal(self._model)
