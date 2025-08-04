@@ -71,7 +71,7 @@ class MBModel:
         self._build_model()
 
     # -------------------- model --------------------
-@@ -97,64 +99,67 @@ class MBModel:
+class MBModel:
         with pyro.plate("genes", self.n_genes):
             r = pyro.sample("r", dist.Gamma(2.0, 0.1))
         r = r.unsqueeze(0).expand(xs.shape[0], -1)
