@@ -226,7 +226,7 @@ class MBModel:
         logits = torch.clamp(logits, min=-20, max=20)  # Prevent overflow
         
         # Likelihood
-        counts = x.round().to(torch.int64)
+        counts = xs.round().to(torch.int64)
 
         # batch‐plate over cells
         with pyro.plate("cells", counts.size(0)):
