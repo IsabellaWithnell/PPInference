@@ -235,7 +235,7 @@ class MBModel:
 
         # batch‐plate over cells
         with pyro.plate("cells", counts.size(0)):
-        pyro.sample("obs",
+            pyro.sample("obs",
                     dist.NegativeBinomial(total_count=self.r_edges, logits=self.logits),
                     obs=counts)
 
