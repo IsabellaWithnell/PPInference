@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
-from typing import Optional, Union
+from typing import TYPE_CHECKING
 
-import numpy as np
-import pandas as pd
 import pyro
 import pyro.distributions as dist
 import torch
-from anndata import AnnData
 from pyro.infer import SVI, Trace_ELBO
 from pyro.infer.autoguide import AutoNormal
 from torch.utils.data import DataLoader, TensorDataset
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+    
+    import pandas as pd
+    from anndata import AnnData
 
 __all__ = ["MBModel", "export_networks"]
 
@@ -169,9 +171,8 @@ class MBModel:
                 tau = pyro.sample("tau", dist.Normal(0.0, 0.5))
             
             # Cell type-specific modulation
-            with pyro.plate("cell_types", self.n_types):
-                with pyro.plate("edges_phi", self.n_edges):
-                    phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
+            with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
+                phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
             phi = phi.T  # Shape: (n_edges, n_types)
             
             # Compute edge weights
@@ -189,9 +190,8 @@ class MBModel:
                 w = pyro.sample("w", dist.Normal(0.0, 1.0))
             
             # Cell type-specific modulation
-            with pyro.plate("cell_types", self.n_types):
-                with pyro.plate("edges_phi", self.n_edges):
-                    phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
+            with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
+                phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
             phi = phi.T
             
             # Compute edge weights
@@ -244,7 +244,7 @@ class MBModel:
     def fit(
         self, 
         epochs: int = 400, 
-        lr: Optional[float] = None, 
+        lr: float | None = None, 
         *, 
         verbose: bool = True,
         log_interval: int = 50,
@@ -317,8 +317,8 @@ class MBModel:
         threshold: float = 0.9,
         return_cell_type_specific: bool = False,
         include_confidence: bool = True,
-        quantiles: list[float] = [0.05, 0.5, 0.95],
-    ) -> Union[pd.DataFrame, dict[str, pd.DataFrame]]:
+        quantiles: list[float] | None = None,
+    ) -> pd.DataFrame | dict[str, pd.DataFrame]:
         """Export inferred PPI networks.
         
         Parameters
@@ -329,7 +329,7 @@ class MBModel:
             If True, return cell-type specific networks
         include_confidence : bool
             If True, include confidence intervals
-        quantiles : list[float]
+        quantiles : list[float] or None
             Quantiles to compute for confidence intervals
             
         Returns
@@ -338,6 +338,9 @@ class MBModel:
             Network edges with probabilities and weights
         """
         import pandas as pd
+        
+        if quantiles is None:
+            quantiles = [0.05, 0.5, 0.95]
         
         # Get posterior quantiles
         q_dict = self.guide.quantiles(quantiles)
@@ -349,7 +352,6 @@ class MBModel:
             
             # Filter by threshold
             keep_mask = edge_probs >= threshold
-            keep_indices = torch.where(keep_mask)[0]
             
         else:  # horseshoe
             # For horseshoe, use weight magnitude
@@ -363,7 +365,6 @@ class MBModel:
             # Use threshold as percentile for horseshoe
             threshold_value = torch.quantile(weight_magnitude, threshold)
             keep_mask = weight_magnitude >= threshold_value
-            keep_indices = torch.where(keep_mask)[0]
         
         if not return_cell_type_specific:
             # Global network
@@ -425,7 +426,7 @@ class MBModel:
 
     def predict_expression(
         self, 
-        cell_types: Optional[torch.Tensor] = None,
+        cell_types: torch.Tensor | None = None,
         n_samples: int = 100,
     ) -> torch.Tensor:
         """Generate expression predictions from the fitted model.
