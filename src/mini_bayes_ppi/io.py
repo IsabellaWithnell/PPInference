@@ -30,7 +30,7 @@ def load_string_prior(
             elif isinstance(pair, (tuple, list)) and len(pair) == 2:
                 a, b = pair
             else:
-                raise ValueError(f'Edge specification {pair!r} is neither string nor 2‑tuple.')
+                raise ValueError(f'Edge specification {pair!r} is neither string nor 2-tuple.')
             if a in name_to_ix and b in name_to_ix:
                 edges.append((name_to_ix[a], name_to_ix[b]))
         return edges
