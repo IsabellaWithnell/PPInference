@@ -231,11 +231,14 @@ class MBModel:
         r_expanded = r.unsqueeze(0).expand(batch_size, -1)
         
         # Likelihood
-        pyro.sample(
-            "obs",
-            dist.NegativeBinomial(total_count=r_expanded, logits=logits).to_event(1),
-            obs=xs,
-        )
+        counts = x_batch.round().to(torch.int64)
+
+        # batch‐plate over cells
+        with pyro.plate("cells", counts.size(0)):
+        pyro.sample("obs",
+                    dist.NegativeBinomial(total_count=self.r_edges, logits=self.logits),
+                    obs=counts)
+
 
     def _build_model(self) -> None:
         """Build the model and inference components."""
