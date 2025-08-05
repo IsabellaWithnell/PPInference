@@ -227,12 +227,12 @@ class MBModel:
         
         # Likelihood
         counts = xs.round().to(torch.int64)
-
-        # batch‐plate over cells
         with pyro.plate("cells", counts.size(0)):
-            pyro.sample("obs",
-                    dist.NegativeBinomial(total_count=self.r_edges, logits=self.logits),
-                    obs=counts)
+            pyro.sample(
+                "obs",
+                dist.NegativeBinomial(total_count=r, logits=logits).to_event(1),
+                obs=counts,
+            )
 
 
     def _build_model(self) -> None:
