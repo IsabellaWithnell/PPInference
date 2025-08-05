@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Sequence
 from typing import Optional, Union
-
+import pandas as pd  
 import numpy as np
 import pyro
 import pyro.distributions as dist
