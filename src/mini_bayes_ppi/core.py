@@ -47,6 +47,7 @@ class MBModel:
         *,
         cell_key: str = "cell_type",
         batch_size: int = 1024,
+        temp: float = 1,
         lr: float = 5e-3,
         device: str | None = None,
         prior_type: str = "spike_slab",  # New: choice of prior
@@ -90,6 +91,7 @@ class MBModel:
         self.lr = lr
         self.prior_type = prior_type
         self.edge_prior_prob = edge_prior_prob
+        self.z_temperature   = temp
 
         # Gene information
         self.genes: list[str] = list(adata.var_names)
@@ -165,7 +167,7 @@ class MBModel:
         if self.prior_type == "spike_slab":
             # Spike-and-slab prior for edge selection
             with pyro.plate("edges_z", self.n_edges):
-                z = pyro.sample("z", dist.RelaxedBernoulli(temperature=τ, probs=self.edge_prior_prob))
+                z = pyro.sample("z", dist.RelaxedBernoulli(self.z_temperature, probs=self.edge_prior_prob))
             
             with pyro.plate("edges_tau", self.n_edges):
                 tau = pyro.sample("tau", dist.Normal(0.0, 0.5))
@@ -286,7 +288,7 @@ class MBModel:
         for epoch in range(epochs):
             epoch_loss = 0.0
             n_batches = 0
-            
+            self.z_temperature = max(0.01, self.z_temperature * 0.95)
             for xb, ct, lib in self.loader:
                 loss = self.svi.step(xb, ct, lib)
                 epoch_loss += loss
