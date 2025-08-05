@@ -22,6 +22,9 @@ classifiers     = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
@@ -39,35 +42,90 @@ dynamic = ["version"]
 [project.optional-dependencies]
 test = [
   "pytest>=8.0",
-  "pytest-cov",
-  "torch",
+  "pytest-cov>=4.0",
   "ruff>=0.4",
+  # Core dependencies (ensure compatibility)
+  "torch>=2.1",
+  "pyro-ppl>=1.9",
   "anndata>=0.10",
   "pandas>=2.0", 
   "numpy>=1.24",
   "scipy>=1.11",
-  "pyro-ppl>=1.9",
-  "matplotlib>=3.5",  # Add for notebook
-  "seaborn>=0.11",    # Add for notebook
-  "networkx>=2.6",    # Add for notebook
+  # Additional test dependencies
+  "matplotlib>=3.5",
+  "seaborn>=0.11",
+  "networkx>=2.6",
 ]
 docs = [
-  "sphinx",
-  "sphinx-rtd-theme",
+  "sphinx>=6.0",
+  "sphinx-rtd-theme>=1.0",
+  "sphinx-autodoc-typehints>=1.0",
 ]
+
 [project.urls]
 Homepage        = "https://github.com/IsabellaWithnell/mini_bayes_ppi"
 Documentation   = "https://mini-bayes-ppi.readthedocs.io"
 Source          = "https://github.com/IsabellaWithnell/mini_bayes_ppi"
 Issues          = "https://github.com/IsabellaWithnell/mini_bayes_ppi/issues"
+Changelog       = "https://github.com/IsabellaWithnell/mini_bayes_ppi/releases"
 
 [tool.hatch.version]
 source          = "vcs"
 
+[tool.hatch.build.targets.wheel]
+packages        = ["src/mini_bayes_ppi"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests", 
+  "/README.md",
+  "/LICENSE",
+]
+
 [tool.ruff]
 line-length     = 100
-select          = ["E", "F", "I", "UP", "B", "C4"]
+target-version  = "py39"
+
+[tool.ruff.lint]
+select          = ["E", "F", "I", "UP", "B", "C4", "SIM", "TCH"]
+ignore          = [
+  "E501",  # Line too long (handled by formatter)
+  "B008",  # Do not perform function calls in argument defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # Allow assert in tests
 
 [tool.pytest.ini_options]
-addopts         = "-q"
+addopts         = [
+  "-ra",
+  "--strict-markers", 
+  "--strict-config",
+  "--cov=mini_bayes_ppi",
+  "--cov-report=term-missing",
+]
 pythonpath      = ["src"]
+testpaths       = ["tests"]
+markers         = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+  "gpu: marks tests as requiring GPU",
+]
+
+[tool.coverage.run]
+source          = ["mini_bayes_ppi"]
+branch          = true
+
+[tool.coverage.report]
+exclude_lines   = [
+  "pragma: no cover",
+  "def __repr__",
+  "if self.debug:",
+  "if settings.DEBUG",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "if 0:",
+  "if __name__ == .__main__.:",
+  "class .*\\bProtocol\\):",
+  "@(abc\\.)?abstractmethod",
+]
