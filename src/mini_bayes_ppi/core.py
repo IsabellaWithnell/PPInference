@@ -165,7 +165,7 @@ class MBModel:
         if self.prior_type == "spike_slab":
             # Spike-and-slab prior for edge selection
             with pyro.plate("edges_z", self.n_edges):
-                z = pyro.sample("z", dist.Bernoulli(self.edge_prior_prob))
+                z = pyro.sample("z", dist.RelaxedBernoulli(temperature=τ, probs=self.edge_prior_prob))
             
             with pyro.plate("edges_tau", self.n_edges):
                 tau = pyro.sample("tau", dist.Normal(0.0, 0.5))
