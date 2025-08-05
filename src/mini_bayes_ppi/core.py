@@ -229,7 +229,7 @@ class MBModel:
         r_expanded = r.unsqueeze(0).expand(batch_size, -1)
         
         # Likelihood
-        counts = xb.round().to(torch.int64)
+        counts = x.round().to(torch.int64)
 
         # batch‐plate over cells
         with pyro.plate("cells", counts.size(0)):
