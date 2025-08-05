@@ -305,7 +305,7 @@ class MBModel:
 
     def export_networks(
         self, 
-        threshold: float = 0.9,
+        threshold: float = 0.5,
         return_cell_type_specific: bool = False,
         include_confidence: bool = True,
         quantiles: list[float] | None = None,
