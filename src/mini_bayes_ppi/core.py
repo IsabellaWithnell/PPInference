@@ -1,19 +1,8 @@
-"""
-Context-Specific Protein Interaction Activity Inference from scRNA-seq
-
-This module infers which known protein-protein interactions are likely active
-in specific cell types based on gene expression patterns. It does NOT discover
-new protein interactions, but rather identifies context-specific activity of
-known interactions.
-"""
-
 from __future__ import annotations
 
 import logging
-import warnings
 from typing import TYPE_CHECKING
 
-import numpy as np
 import scipy.sparse as spsp
 import torch
 import pyro
@@ -22,81 +11,70 @@ from pyro.infer import SVI, Trace_ELBO
 from pyro.infer.autoguide import AutoNormal
 from torch.utils.data import DataLoader, TensorDataset
 
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
+    
     import pandas as pd
     from anndata import AnnData
 
-__all__ = ["PPIActivityModel", "export_activity_scores"]
+__all__ = ["MBModel", "export_networks"]
 
 logger = logging.getLogger(__name__)
 
 
-def _validate_edges(n_genes: int, edges: Sequence[tuple[int, int]]) -> torch.Tensor:
-    """Validate and create edge tensor from gene pairs."""
+def _edge_index(n_genes: int, edges: Sequence[tuple[int, int]]) -> torch.Tensor:
+    """Return a symmetric edge index tensor for the given gene pairs."""
     if not edges:
-        raise ValueError("No edges provided. Need known PPIs from STRING or similar database.")
+        raise ValueError("prior_edges is empty; nothing to learn.")
     
-    edge_set = set()
+    # Validate edge indices
     for i, j in edges:
         if not (0 <= i < n_genes and 0 <= j < n_genes):
             raise ValueError(f"Edge ({i}, {j}) contains invalid gene indices")
         if i == j:
-            logger.warning(f"Self-loop detected and skipped: ({i}, {j})")
-            continue
-        # Store edges in canonical form (smaller index first)
-        edge_set.add((min(i, j), max(i, j)))
+            raise ValueError(f"Self-loop detected: ({i}, {j})")
     
-    if not edge_set:
-        raise ValueError("No valid edges after filtering")
-    
-    # Convert to tensor
-    edge_list = list(edge_set)
-    return torch.tensor(edge_list, dtype=torch.long).t()
+    idx = torch.tensor(edges, dtype=torch.long).t()
+    rev = idx[[1, 0], :]
+    idx = torch.cat([idx, rev], dim=1).unique(dim=1)
+    return idx
 
 
-class PPIActivityModel:
-    """
-    Infer context-specific activity of known protein-protein interactions.
-    
-    This model takes known PPIs (e.g., from STRING) and infers which interactions
-    are likely active in different cell types based on gene co-expression patterns.
-    It does NOT discover new interactions.
-    """
-    
+class MBModel:
     def __init__(
         self,
         adata: AnnData,
-        known_interactions: Iterable[tuple[int, int]],
+        prior_edges: Iterable[tuple[int, int]],
         *,
         cell_key: str = "cell_type",
-        batch_size: int = 512,
-        lr: float = 1e-2,
+        batch_size: int = 1024,
+        temp: float = 1,
+        lr: float = 5e-3,
         device: str | None = None,
-        interaction_confidence: dict[tuple[int, int], float] | None = None,
-        min_expression_percentile: float = 10.0,
+        prior_type: str = "spike_slab",  # New: choice of prior
+        edge_prior_prob: float = 0.5,    # New: customizable prior
     ) -> None:
-        """
-        Initialize PPI activity inference model.
+        """Initialize the Bayesian PPI inference model.
         
         Parameters
         ----------
         adata : AnnData
-            Single-cell expression data
-        known_interactions : Iterable[tuple[int, int]]
-            Known protein interactions as gene index pairs (e.g., from STRING)
+            Annotated data matrix with gene expression counts
+        prior_edges : Iterable[tuple[int, int]]
+            Prior edges as gene index pairs
         cell_key : str
-            Column in adata.obs with cell type labels
+            Key in adata.obs containing cell type labels
         batch_size : int
             Batch size for training
         lr : float
-            Learning rate
+            Learning rate for optimization
         device : str or None
-            Device ('cuda', 'cpu', or None for auto)
-        interaction_confidence : dict or None
-            Prior confidence scores for each interaction (0-1)
-        min_expression_percentile : float
-            Minimum expression percentile for genes to be considered
+            Device to use ('cuda', 'cpu', or None for auto)
+        prior_type : str
+            Type of prior: 'spike_slab' or 'horseshoe'
+        edge_prior_prob : float
+            Prior probability of edge existence (for spike-slab)
         """
         # Device setup
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -106,188 +84,190 @@ class PPIActivityModel:
         if cell_key not in adata.obs.columns:
             raise ValueError(f"Cell type key '{cell_key}' not found in adata.obs")
         
+        if prior_type not in ["spike_slab", "horseshoe"]:
+            raise ValueError(f"Unknown prior_type: {prior_type}")
+        
         # Store parameters
         self.adata = adata
         self.batch_size = batch_size
         self.lr = lr
-        self.min_expr_pct = min_expression_percentile
-        
+        self.prior_type = prior_type
+        self.edge_prior_prob = edge_prior_prob
+        self.z_temperature   = temp
+
         # Gene information
-        self.genes = list(adata.var_names)
+        self.genes: list[str] = list(adata.var_names)
         self.n_genes = len(self.genes)
         self.n_cells = adata.n_obs
-        
+
         # Cell type information
-        self.ctypes = sorted(adata.obs[cell_key].astype(str).unique())
+        self.ctypes: list[str] = sorted(adata.obs[cell_key].astype(str).unique())
         self.n_types = len(self.ctypes)
-        ct_lookup = {c: i for i, c in enumerate(self.ctypes)}
+        ct_lookup: dict[str, int] = {c: i for i, c in enumerate(self.ctypes)}
         
         self.ct_idx = torch.tensor(
             [ct_lookup[c] for c in adata.obs[cell_key].astype(str)],
             dtype=torch.long,
             device=self.device
         )
-        
-        # Process known interactions
-        edge_list = list(known_interactions)
-        self.edge_idx = _validate_edges(self.n_genes, edge_list).to(self.device)
+
+        # Edge information
+        edge_list = list(prior_edges)
+        self.edge_idx = _edge_index(self.n_genes, edge_list).to(self.device)
         self.n_edges = self.edge_idx.shape[1]
         
-        # Store confidence scores if provided
-        if interaction_confidence:
-            self.edge_confidence = torch.zeros(self.n_edges, device=self.device)
-            for idx, (i, j) in enumerate(edge_list):
-                key = (min(i, j), max(i, j))
-                self.edge_confidence[idx] = interaction_confidence.get(key, 0.5)
-        else:
-            self.edge_confidence = torch.ones(self.n_edges, device=self.device) * 0.5
+        logger.info(f"Model initialized: {self.n_genes} genes, {self.n_types} cell types, "
+                   f"{self.n_edges} edges, {self.n_cells} cells")
+
+        # Expression data
+        X_arr = adata.X.toarray() if spsp.issparse(adata.X) else adata.X
+
+        x = torch.tensor(X_arr, dtype=torch.float32, device=self.device)
         
-        logger.info(
-            f"Model initialized: {self.n_genes} genes, {self.n_types} cell types, "
-            f"{self.n_edges} known interactions, {self.n_cells} cells"
-        )
-        
-        # Process expression data
-        self._prepare_expression_data()
-        
-        # Build model
-        self._build_model()
-    
-    def _prepare_expression_data(self):
-        """Prepare and normalize expression data."""
-        # Convert to dense if sparse
-        X_arr = self.adata.X.toarray() if spsp.issparse(self.adata.X) else self.adata.X.copy()
-        
-        # Log-transform and normalize
-        X_arr = np.log1p(X_arr)  # log(x + 1) transformation
-        
-        # Filter low-expression genes for interaction inference
-        gene_expr_pct = np.percentile(X_arr, self.min_expr_pct, axis=0)
-        self.expressed_mask = torch.tensor(gene_expr_pct > 0, device=self.device)
-        
+        self.X = x.to(self.device)
+
         # Library size normalization
-        library_size = np.sum(X_arr, axis=1, keepdims=True)
-        X_norm = X_arr / (library_size + 1e-10) * np.median(library_size)
-        
-        # Convert to tensor
-        self.X = torch.tensor(X_norm, dtype=torch.float32, device=self.device)
-        
+        libsize = torch.sum(self.X, dim=1, keepdim=True) + 1.0
+        self.log_lib = libsize.log()
+
         # Create data loader
-        dataset = TensorDataset(self.X, self.ct_idx)
+        dataset = TensorDataset(self.X, self.ct_idx, self.log_lib)
         self.loader = DataLoader(
             dataset,
-            batch_size=self.batch_size,
+            batch_size=batch_size,
             shuffle=True,
             drop_last=False,
             pin_memory=(self.device.type == "cuda"),
-            num_workers=0,
+            num_workers=0,  # Set to 0 to avoid multiprocessing issues
         )
-    
-    def _model(self, x: torch.Tensor, ct: torch.Tensor) -> None:
+
+        self._build_model()
+
+    def _model(self, xs: torch.Tensor, ct: torch.Tensor, log_lib: torch.Tensor) -> None:
+        """Bayesian generative model for PPI inference.
+        
+        Parameters
+        ----------
+        xs : torch.Tensor
+            Gene expression counts (batch_size, n_genes)
+        ct : torch.Tensor
+            Cell type indices (batch_size,)
+        log_lib : torch.Tensor
+            Log library size (batch_size, 1)
         """
-        Bayesian model for PPI activity inference.
+        batch_size = xs.shape[0]
         
-        This model infers which known interactions are active based on
-        expression correlation patterns.
-        """
-        batch_size = x.shape[0]
+        # Gene-specific baseline expression
+        with pyro.plate("genes_bias", self.n_genes):
+            bias = pyro.sample("bias", dist.Normal(0.0, 1.0))
         
-        # Global interaction activity (baseline across all cell types)
-        with pyro.plate("edges_global", self.n_edges):
-            # Use confidence scores as prior mean
-            global_activity = pyro.sample(
-                "global_activity",
-                dist.Beta(
-                    self.edge_confidence * 10 + 1,  # α parameter
-                    (1 - self.edge_confidence) * 10 + 1  # β parameter
-                )
-            )
+        # Negative binomial dispersion (inverse dispersion)
+        with pyro.plate("genes_r", self.n_genes):
+            r = pyro.sample("r", dist.Gamma(2.0, 0.1))
         
-        # Cell type-specific modulation of activity
-        with pyro.plate("cell_types", self.n_types, dim=-2):
-            with pyro.plate("edges_ct", self.n_edges, dim=-1):
-                # How much each cell type modulates each interaction
-                ct_modulation = pyro.sample(
-                    "ct_modulation",
-                    dist.Normal(0.0, 0.3)
-                )
+        # --- common plates for phi: edges × cell_types → phi (n_edges, n_types) ---
+        with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
+            phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
+
+        # pick out the cell-type column for each cell and transpose → (batch_size, n_edges)
+        phi_batch = phi[:, ct].T
+
+        if self.prior_type == "spike_slab":
+            temp = torch.tensor(self.z_temperature, device=self.device)
+            with pyro.plate("edges_z", self.n_edges):
+                z = pyro.sample("z", dist.RelaxedBernoulli(temp, probs=self.edge_prior_prob))
+            with pyro.plate("edges_tau", self.n_edges):
+                tau = pyro.sample("tau", dist.Normal(0.0, 0.5))
+            # spike-and-slab interaction
+            W_edges = z * (tau + phi_batch)
+        else:
+            # horseshoe
+            tau_global = pyro.sample("tau_global", dist.HalfCauchy(1.0))
+            with pyro.plate("edges_local", self.n_edges):
+                tau_local = pyro.sample("tau_local", dist.HalfCauchy(1.0))
+            with pyro.plate("edges_w", self.n_edges):
+                w = pyro.sample("w", dist.Normal(0.0, 1.0))
+            base_weight = tau_global * tau_local * w
+            W_edges = base_weight + phi_batch
         
-        # Compute cell-type specific activity scores
-        # Shape: (n_edges, n_types) -> select for current batch -> (batch_size, n_edges)
-        ct_activity_logits = torch.logit(global_activity).unsqueeze(-1) + ct_modulation
-        ct_activity = torch.sigmoid(ct_activity_logits)
-        
-        # Select activities for current batch's cell types
-        batch_activity = ct_activity[:, ct].T  # (batch_size, n_edges)
-        
-        # Model co-expression given interaction activity
+        # Apply edge interactions efficiently
         i, j = self.edge_idx
         
-        # Calculate pairwise expression products (co-expression strength)
-        expr_i = x[:, i]  # (batch_size, n_edges)
-        expr_j = x[:, j]  # (batch_size, n_edges)
+        # Numerical stability: clamp expression values
+        xs_clamped = torch.clamp(xs, min=0, max=1e4)
         
-        # Check if both genes are expressed
-        both_expressed = self.expressed_mask[i] & self.expressed_mask[j]
+        # Compute interaction effects
+        interaction_effects_i = xs_clamped[:, j] * W_edges  # Gene j -> Gene i
+        interaction_effects_j = xs_clamped[:, i] * W_edges  # Gene i -> Gene j
         
-        # Co-expression strength (using correlation-like measure)
-        # Standardize within batch
-        expr_i_std = (expr_i - expr_i.mean(dim=0)) / (expr_i.std(dim=0) + 1e-6)
-        expr_j_std = (expr_j - expr_j.mean(dim=0)) / (expr_j.std(dim=0) + 1e-6)
+        # Accumulate effects
+        Wx = torch.zeros_like(xs)
+        Wx.scatter_add_(1, i.unsqueeze(0).expand(batch_size, -1), interaction_effects_i)
+        Wx.scatter_add_(1, j.unsqueeze(0).expand(batch_size, -1), interaction_effects_j)
         
-        coexpr_strength = expr_i_std * expr_j_std  # Element-wise product
+        # Numerical stability: clamp interaction effects
+        Wx = torch.clamp(Wx, min=-10, max=10)
         
-        # Expected co-expression given activity
-        expected_coexpr = batch_activity * both_expressed.float()
+        # Compute log rates with stability
+        logits = log_lib + bias + Wx
+        logits = torch.clamp(logits, min=-20, max=20)  # Prevent overflow
         
-        # Observation model: co-expression strength depends on interaction activity
-        with pyro.plate("cells", batch_size, dim=-2):
-            with pyro.plate("edges_obs", self.n_edges, dim=-1):
-                pyro.sample(
-                    "coexpr_obs",
-                    dist.Normal(expected_coexpr, 0.5),
-                    obs=torch.sigmoid(coexpr_strength)  # Squash to [0, 1]
-                )
-    
-    def _build_model(self):
+        # Likelihood
+        counts = xs.round().to(torch.int64)
+        with pyro.plate("cells", counts.size(0)):
+            pyro.sample(
+                "obs",
+                dist.NegativeBinomial(total_count=r, logits=logits).to_event(1),
+                obs=counts,
+            )
+
+
+    def _build_model(self) -> None:
         """Build the model and inference components."""
         self.guide = AutoNormal(self._model)
         self.svi = SVI(
-            self._model,
-            self.guide,
-            pyro.optim.Adam({"lr": self.lr}),
+            self._model, 
+            self.guide, 
+            pyro.optim.Adam({"lr": self.lr}), 
             Trace_ELBO()
         )
-    
+
     def fit(
-        self,
-        epochs: int = 1000,
+        self, 
+        epochs: int = 400, 
+        lr: float | None = None, 
+        *, 
         verbose: bool = True,
-        log_interval: int = 100,
-        patience: int = 100,
+        log_interval: int = 50,
+        patience: int = 50,
         min_delta: float = 1e-4,
     ) -> dict:
-        """
-        Fit the model using variational inference.
+        """Fit the model using stochastic variational inference.
         
         Parameters
         ----------
         epochs : int
-            Maximum training epochs
+            Maximum number of training epochs
+        lr : float or None
+            Learning rate (updates the optimizer if provided)
         verbose : bool
-            Print progress
+            Whether to print training progress
         log_interval : int
             Epochs between progress updates
         patience : int
-            Early stopping patience
+            Early stopping patience (epochs without improvement)
         min_delta : float
-            Minimum improvement for early stopping
+            Minimum change in loss for early stopping
             
         Returns
         -------
         dict
-            Training history
+            Training history with 'loss' key
         """
+        if lr is not None:
+            self.lr = lr
+            self._build_model()
+        
         pyro.clear_param_store()
         
         history = {"loss": []}
@@ -297,16 +277,16 @@ class PPIActivityModel:
         for epoch in range(epochs):
             epoch_loss = 0.0
             n_batches = 0
-            
-            for x_batch, ct_batch in self.loader:
-                loss = self.svi.step(x_batch, ct_batch)
+            self.z_temperature = max(0.01, self.z_temperature * 0.95)
+            for xb, ct, lib in self.loader:
+                loss = self.svi.step(xb, ct, lib)
                 epoch_loss += loss
                 n_batches += 1
             
             avg_loss = epoch_loss / n_batches
             history["loss"].append(avg_loss)
             
-            # Early stopping
+            # Early stopping check
             if avg_loss < best_loss - min_delta:
                 best_loss = avg_loss
                 patience_counter = 0
@@ -319,251 +299,187 @@ class PPIActivityModel:
                 break
             
             if verbose and epoch % log_interval == 0:
-                logger.info(f"[Epoch {epoch:04d}] Loss: {avg_loss:.4f}")
+                logger.info(f"[Epoch {epoch:04d}] ELBO: {avg_loss:.2f}")
         
         return history
-    
-    def export_activity_scores(
-        self,
-        threshold: float = 0.7,
+
+    def export_networks(
+        self, 
+        threshold: float = 0.5,
         return_cell_type_specific: bool = False,
         include_confidence: bool = True,
-        fdr_control: bool = True,
+        quantiles: list[float] | None = None,
     ) -> pd.DataFrame | dict[str, pd.DataFrame]:
-        """
-        Export inferred interaction activity scores.
+        """Export inferred PPI networks.
         
         Parameters
         ----------
         threshold : float
-            Activity score threshold (0-1)
+            Probability threshold for edge inclusion (spike-slab only)
         return_cell_type_specific : bool
-            Return cell-type specific activities
+            If True, return cell-type specific networks
         include_confidence : bool
-            Include confidence intervals
-        fdr_control : bool
-            Apply FDR correction to scores
+            If True, include confidence intervals
+        quantiles : list[float] or None
+            Quantiles to compute for confidence intervals
             
         Returns
         -------
         pd.DataFrame or dict[str, pd.DataFrame]
-            Interaction activity scores
+            Network edges with probabilities and weights
         """
         import pandas as pd
-        from scipy import stats
         
-        # Get posterior estimates
-        quantiles = [0.025, 0.5, 0.975] if include_confidence else [0.5]
-        posterior = self.guide.quantiles(quantiles)
+        if quantiles is None:
+            quantiles = [0.05, 0.5, 0.95]
         
-        global_activity = posterior["global_activity"]
-        ct_modulation = posterior["ct_modulation"]
+        # Get posterior quantiles
+        q_dict = self.guide.quantiles(quantiles)
+        
+        if self.prior_type == "spike_slab":
+            # Extract edge probabilities
+            z_samples = q_dict["z"]  # Shape: (n_quantiles, n_edges)
+            edge_probs = z_samples[len(quantiles)//2]  # Median
+            
+            # Filter by threshold
+            keep_mask = edge_probs >= threshold
+            
+        else:  # horseshoe
+            # For horseshoe, use weight magnitude
+            tau_global = q_dict["tau_global"][len(quantiles)//2]
+            tau_local = q_dict["tau_local"][len(quantiles)//2]
+            w = q_dict["w"][len(quantiles)//2]
+            
+            edge_weights = tau_global * tau_local * w
+            weight_magnitude = torch.abs(edge_weights)
+            
+            # Use threshold as percentile for horseshoe
+            threshold_value = torch.quantile(weight_magnitude, threshold)
+            keep_mask = weight_magnitude >= threshold_value
         
         if not return_cell_type_specific:
-            # Global activity scores
-            activity_median = global_activity[len(quantiles)//2].cpu().numpy()
-            
-            # Apply FDR if requested
-            if fdr_control:
-                # Convert to p-values (distance from 0.5)
-                p_values = 2 * np.minimum(activity_median, 1 - activity_median)
-                # Benjamini-Hochberg correction
-                from scipy.stats import false_discovery_control
-                adjusted_p = false_discovery_control(p_values)
-                keep_mask = adjusted_p < (1 - threshold)
-            else:
-                keep_mask = activity_median >= threshold
-            
-            # Get edge indices
+            # Global network
             i_indices = self.edge_idx[0, keep_mask].cpu().numpy()
             j_indices = self.edge_idx[1, keep_mask].cpu().numpy()
             
-            result = {
-                "protein1": [self.genes[i] for i in i_indices],
-                "protein2": [self.genes[j] for j in j_indices],
-                "activity_score": activity_median[keep_mask],
-                "prior_confidence": self.edge_confidence[keep_mask].cpu().numpy(),
+            result_data = {
+                "gene_i": [self.genes[i] for i in i_indices],
+                "gene_j": [self.genes[j] for j in j_indices],
             }
             
-            if include_confidence:
-                result["activity_lower"] = global_activity[0][keep_mask].cpu().numpy()
-                result["activity_upper"] = global_activity[-1][keep_mask].cpu().numpy()
-                result["confidence_width"] = result["activity_upper"] - result["activity_lower"]
+            if self.prior_type == "spike_slab":
+                result_data["probability"] = edge_probs[keep_mask].cpu().numpy()
+                
+                if include_confidence:
+                    result_data["prob_lower"] = z_samples[0][keep_mask].cpu().numpy()
+                    result_data["prob_upper"] = z_samples[-1][keep_mask].cpu().numpy()
             
-            df = pd.DataFrame(result)
-            df = df.sort_values("activity_score", ascending=False)
+            # Add weights
+            tau = q_dict["tau"][len(quantiles)//2] if "tau" in q_dict else edge_weights
+            result_data["weight"] = tau[keep_mask].cpu().numpy()
             
-            # Add interpretation column
-            df["interpretation"] = df["activity_score"].apply(
-                lambda x: "High" if x > 0.8 else "Moderate" if x > 0.6 else "Low"
-            )
+            if include_confidence and "tau" in q_dict:
+                result_data["weight_lower"] = q_dict["tau"][0][keep_mask].cpu().numpy()
+                result_data["weight_upper"] = q_dict["tau"][-1][keep_mask].cpu().numpy()
             
-            return df
-            
+            return pd.DataFrame(result_data)
+        
         else:
-            # Cell type-specific activities
-            results = {}
+            # Cell-type specific networks
+            networks = {}
+            phi = q_dict["phi"][len(quantiles)//2]  # median → (n_edges, n_types)
             
             for ct_idx, ct_name in enumerate(self.ctypes):
-                # Compute cell-type specific activity
-                ct_logits = (
-                    torch.logit(global_activity[len(quantiles)//2]) +
-                    ct_modulation[len(quantiles)//2][:, ct_idx]
-                )
-                ct_activity = torch.sigmoid(ct_logits).cpu().numpy()
+                # select the ct_idx column out of the (n_edges, n_types) matrix
+                phi_ct = phi[:, ct_idx]  # → (n_edges,)
+                if self.prior_type == "spike_slab":
+                    tau_med = q_dict["tau"][len(quantiles)//2]  # shape: (n_edges,)
+                    ct_weights = edge_probs * (tau_med + phi_ct)
+                else:
+                    ct_weights = edge_weights + phi_ct
                 
-                # Filter by threshold
-                keep_mask = ct_activity >= threshold
+                # Apply same filtering
+                ct_keep = keep_mask  # Could add cell-type specific filtering
                 
-                i_indices = self.edge_idx[0, keep_mask].cpu().numpy()
-                j_indices = self.edge_idx[1, keep_mask].cpu().numpy()
+                i_indices = self.edge_idx[0, ct_keep].cpu().numpy()
+                j_indices = self.edge_idx[1, ct_keep].cpu().numpy()
                 
-                ct_result = {
-                    "protein1": [self.genes[i] for i in i_indices],
-                    "protein2": [self.genes[j] for j in j_indices],
-                    "activity_score": ct_activity[keep_mask],
-                    "global_activity": global_activity[len(quantiles)//2][keep_mask].cpu().numpy(),
+                ct_data = {
+                    "gene_i": [self.genes[i] for i in i_indices],
+                    "gene_j": [self.genes[j] for j in j_indices],
+                    "weight": ct_weights[ct_keep].cpu().numpy(),
                 }
                 
-                df = pd.DataFrame(ct_result)
-                df["cell_type_specificity"] = df["activity_score"] - df["global_activity"]
-                df = df.sort_values("activity_score", ascending=False)
+                if self.prior_type == "spike_slab":
+                    ct_data["probability"] = edge_probs[ct_keep].cpu().numpy()
                 
-                results[ct_name] = df
+                networks[ct_name] = pd.DataFrame(ct_data)
             
-            return results
-    
-    def plot_activity_heatmap(self, top_n: int = 50) -> None:
-        """
-        Plot heatmap of interaction activities across cell types.
+            return networks
+
+    def predict_expression(
+        self, 
+        cell_types: torch.Tensor | None = None,
+        n_samples: int = 100,
+    ) -> torch.Tensor:
+        """Generate expression predictions from the fitted model.
         
         Parameters
         ----------
-        top_n : int
-            Number of top variable interactions to show
-        """
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        
-        # Get posterior estimates
-        posterior = self.guide.quantiles([0.5])
-        global_activity = posterior["global_activity"][0]
-        ct_modulation = posterior["ct_modulation"][0]
-        
-        # Compute cell-type specific activities
-        activities = []
-        for ct_idx in range(self.n_types):
-            ct_logits = torch.logit(global_activity) + ct_modulation[:, ct_idx]
-            activities.append(torch.sigmoid(ct_logits).cpu().numpy())
-        
-        activities = np.array(activities).T  # (n_edges, n_types)
-        
-        # Find most variable interactions
-        activity_var = np.var(activities, axis=1)
-        top_indices = np.argsort(activity_var)[-top_n:]
-        
-        # Create heatmap
-        fig, ax = plt.subplots(figsize=(10, 12))
-        
-        # Prepare labels
-        edge_labels = []
-        for idx in top_indices:
-            i, j = self.edge_idx[:, idx].cpu().numpy()
-            edge_labels.append(f"{self.genes[i]}-{self.genes[j]}")
-        
-        # Plot
-        sns.heatmap(
-            activities[top_indices],
-            xticklabels=self.ctypes,
-            yticklabels=edge_labels,
-            cmap="RdBu_r",
-            center=0.5,
-            vmin=0,
-            vmax=1,
-            cbar_kws={"label": "Interaction Activity"},
-            ax=ax
-        )
-        
-        ax.set_title("Cell Type-Specific Protein Interaction Activity")
-        ax.set_xlabel("Cell Type")
-        ax.set_ylabel("Protein Interaction")
-        
-        plt.tight_layout()
-        plt.show()
-    
-    def validate_against_known_complexes(
-        self,
-        known_complexes: dict[str, list[str]]
-    ) -> pd.DataFrame:
-        """
-        Validate results against known protein complexes.
-        
-        Parameters
-        ----------
-        known_complexes : dict
-            Dictionary mapping complex names to lists of gene names
+        cell_types : torch.Tensor or None
+            Cell type indices for prediction
+        n_samples : int
+            Number of samples to generate
             
         Returns
         -------
-        pd.DataFrame
-            Validation metrics for each complex
+        torch.Tensor
+            Predicted expression matrix
         """
-        import pandas as pd
+        if cell_types is None:
+            # Sample random cell types
+            cell_types = torch.randint(0, self.n_types, (n_samples,), device=self.device)
         
-        # Get activity scores
-        activities = self.export_activity_scores(threshold=0.0)  # Get all
-        
-        # Create edge set for easy lookup
-        active_edges = set()
-        for _, row in activities.iterrows():
-            if row["activity_score"] > 0.7:
-                active_edges.add((row["protein1"], row["protein2"]))
-                active_edges.add((row["protein2"], row["protein1"]))
-        
-        results = []
-        for complex_name, genes in known_complexes.items():
-            # Count possible edges in complex
-            n_genes = len(genes)
-            n_possible = n_genes * (n_genes - 1) // 2
+        # Use the guide to sample from posterior
+        with torch.no_grad():
+            # Sample library sizes from training data
+            lib_sizes = torch.exp(self.log_lib[torch.randint(0, len(self.log_lib), (n_samples, 1))])
             
-            # Count how many are active
-            n_active = 0
-            for i, g1 in enumerate(genes):
-                for g2 in genes[i+1:]:
-                    if (g1, g2) in active_edges or (g2, g1) in active_edges:
-                        n_active += 1
+            # Generate predictions
+            trace = pyro.poutine.trace(self.guide).get_trace(
+                torch.zeros(n_samples, self.n_genes, device=self.device),
+                cell_types,
+                lib_sizes.log()
+            )
             
-            results.append({
-                "complex": complex_name,
-                "n_proteins": n_genes,
-                "n_possible_interactions": n_possible,
-                "n_active_interactions": n_active,
-                "coverage": n_active / n_possible if n_possible > 0 else 0
-            })
-        
-        return pd.DataFrame(results)
+            # Run model with sampled parameters
+            conditioned_model = pyro.poutine.replay(self._model, trace)
+            
+            with pyro.plate("prediction", n_samples):
+                trace = pyro.poutine.trace(conditioned_model).get_trace(
+                    torch.zeros(n_samples, self.n_genes, device=self.device),
+                    cell_types,
+                    lib_sizes.log()
+                )
+            
+            return trace.nodes["obs"]["value"]
 
 
-def export_activity_scores(
-    model: PPIActivityModel,
-    threshold: float = 0.7,
-    **kwargs
-) -> pd.DataFrame | dict[str, pd.DataFrame]:
-    """
-    Export activity scores from a fitted model.
+def export_networks(model: MBModel, threshold: float = 0.5, **kwargs):
+    """Export networks from a fitted model.
     
     Parameters
     ----------
-    model : PPIActivityModel
-        Fitted model
+    model : MBModel
+        Fitted model instance
     threshold : float
-        Activity threshold
+        Probability threshold for edge inclusion
     **kwargs
-        Additional arguments
+        Additional arguments passed to model.export_networks()
         
     Returns
     -------
     pd.DataFrame or dict
-        Activity scores
+        Exported networks
     """
-    return model.export_activity_scores(threshold, **kwargs)
+    return model.export_networks(threshold, **kwargs)
