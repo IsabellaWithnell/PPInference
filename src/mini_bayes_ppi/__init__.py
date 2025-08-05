@@ -1,9 +1,8 @@
-
-"""Mini‑Bayes PPI: Bayesian multi‑task PPI inference from scRNA‑seq counts."""
+"""Mini‑Bayes PPI: Bayesian multi‑task PPI inference from scRNA‑seq counts."""
 from importlib import metadata as _md
 
 try:
-    __version__ = _md.version(__name__)
+    __version__ = _md.version("mini_bayes_ppi")  # Use actual package name
 except _md.PackageNotFoundError:
     __version__ = "0.0.0.dev0"
 
