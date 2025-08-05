@@ -60,9 +60,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip setuptools wheel
           # Install PyTorch with fallback strategy
-          pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu || \
-          pip install "torch>=2.1" || \
-          pip install torch
+          pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu || pip install "torch>=2.1" || pip install torch
           pip install "pyro-ppl>=1.9"
           pip install -e ".[test]"
       
@@ -172,12 +170,24 @@ jobs:
           name: dist
           path: dist/
       
-      - name: Install from wheel
+      - name: Install from wheel (Unix)
+        if: matrix.os != 'windows-latest'
         run: |
           python -m pip install --upgrade pip
           # Install PyTorch first to avoid dependency conflicts
           pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
           pip install dist/*.whl
+      
+      - name: Install from wheel (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          # Install PyTorch first to avoid dependency conflicts
+          pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
+          # Find and install the wheel file
+          $wheel = Get-ChildItem -Path "dist" -Filter "*.whl" | Select-Object -First 1
+          pip install $wheel.FullName
       
       - name: Test import
         run: |
