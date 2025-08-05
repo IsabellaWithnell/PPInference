@@ -196,7 +196,7 @@ class MBModel:
             # Cell type-specific modulation
             with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
                 phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
-            phi = phi.T
+            phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
             
             # Compute edge weights
             phi_batch = phi[:, ct].T
