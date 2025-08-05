@@ -1,11 +1,10 @@
-import pytest
+import anndata as ad
 import numpy as np
 import pandas as pd
+import pytest
 import torch
-import anndata as ad
-from unittest.mock import patch
 
-from mini_bayes_ppi import MBModel, load_string_prior, export_networks
+from mini_bayes_ppi import MBModel, export_networks, load_string_prior
 from mini_bayes_ppi.core import _edge_index
 
 
@@ -281,7 +280,7 @@ class TestNetworkExport:
         assert isinstance(networks, dict)
         assert set(networks.keys()) == {"TypeA", "TypeB"}
         
-        for ct_name, df in networks.items():
+        for _ct_name, df in networks.items():
             assert isinstance(df, pd.DataFrame)
             assert "gene_i" in df.columns
             assert "gene_j" in df.columns
@@ -469,7 +468,6 @@ class TestSimulationStudy:
         # Calculate recovery metrics
         true_positives = len(true_edge_set.intersection(recovered_edges))
         false_positives = len(recovered_edges - true_edge_set)
-        false_negatives = len(true_edge_set - recovered_edges)
         
         precision = true_positives / (true_positives + false_positives) if recovered_edges else 0
         recall = true_positives / len(true_edge_set) if true_edge_set else 0
@@ -526,7 +524,7 @@ class TestIntegration:
             device="cpu"
         )
         
-        history = model.fit(
+        model.fit(
             epochs=100,
             verbose=False,
             patience=20
