@@ -47,12 +47,14 @@ test = [
   "numpy>=1.24",
   "scipy>=1.11",
   "pyro-ppl>=1.9",
+  "matplotlib>=3.5",  # Add for notebook
+  "seaborn>=0.11",    # Add for notebook
+  "networkx>=2.6",    # Add for notebook
 ]
 docs = [
   "sphinx",
   "sphinx-rtd-theme",
 ]
-
 [project.urls]
 Homepage        = "https://github.com/IsabellaWithnell/mini_bayes_ppi"
 Documentation   = "https://mini-bayes-ppi.readthedocs.io"
