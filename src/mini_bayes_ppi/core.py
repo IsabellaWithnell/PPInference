@@ -465,7 +465,7 @@ class MBModel:
             return trace.nodes["obs"]["value"]
 
 
-def export_networks(model: MBModel, threshold: float = 0.9, **kwargs):
+def export_networks(model: MBModel, threshold: float = 0.5, **kwargs):
     """Export networks from a fitted model.
     
     Parameters
