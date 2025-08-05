@@ -38,6 +38,8 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 "test" = [
+  "pytest-cov",
+  "torch",  # for GPU tests
   "pytest>=8.0",
   "ruff>=0.4",
 ]
