@@ -225,9 +225,6 @@ class MBModel:
         logits = log_lib + bias + Wx
         logits = torch.clamp(logits, min=-20, max=20)  # Prevent overflow
         
-        # Prepare r for broadcasting
-        r_expanded = r.unsqueeze(0).expand(batch_size, -1)
-        
         # Likelihood
         counts = x.round().to(torch.int64)
 
