@@ -165,41 +165,28 @@ class MBModel:
         with pyro.plate("genes_r", self.n_genes):
             r = pyro.sample("r", dist.Gamma(2.0, 0.1))
         
-        # Edge weights with chosen prior
+        # --- common plates for phi: edges × cell_types → phi (n_edges, n_types) ---
+        with pyro.plate("edges_phi", self.n_edges), pyro.plate("cell_types", self.n_types):
+            phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
+
+        # pick out the cell-type column for each cell and transpose → (batch_size, n_edges)
+        phi_batch = phi[:, ct].T
+
         if self.prior_type == "spike_slab":
             temp = torch.tensor(self.z_temperature, device=self.device)
-            # Spike-and-slab prior for edge selection
             with pyro.plate("edges_z", self.n_edges):
                 z = pyro.sample("z", dist.RelaxedBernoulli(temp, probs=self.edge_prior_prob))
-            
             with pyro.plate("edges_tau", self.n_edges):
                 tau = pyro.sample("tau", dist.Normal(0.0, 0.5))
-            
-            # Cell type-specific modulation
-            with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
-                phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
-            
-            # Compute edge weights
-            phi_batch = phi[:, ct].T  # Shape: (batch_size, n_edges)
-            W_edges = z * (tau + phi_batch)  # Spike-and-slab multiplication
-            
-        else:  # horseshoe
-            # Horseshoe prior for edge selection
+            # spike-and-slab interaction
+            W_edges = z * (tau + phi_batch)
+        else:
+            # horseshoe
             tau_global = pyro.sample("tau_global", dist.HalfCauchy(1.0))
-            
             with pyro.plate("edges_local", self.n_edges):
                 tau_local = pyro.sample("tau_local", dist.HalfCauchy(1.0))
-            
             with pyro.plate("edges_w", self.n_edges):
                 w = pyro.sample("w", dist.Normal(0.0, 1.0))
-            
-            # Cell type-specific modulation
-            with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
-                phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
-            phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
-            
-            # Compute edge weights
-            phi_batch = phi[:, ct].T
             base_weight = tau_global * tau_local * w
             W_edges = base_weight + phi_batch
         
@@ -400,14 +387,16 @@ class MBModel:
         else:
             # Cell-type specific networks
             networks = {}
-            phi = q_dict["phi"][len(quantiles)//2]  # Shape: (n_types, n_edges)
+            phi = q_dict["phi"][len(quantiles)//2]  # median → (n_edges, n_types)
             
             for ct_idx, ct_name in enumerate(self.ctypes):
-                # Cell-type specific weights
+                # select the ct_idx column out of the (n_edges, n_types) matrix
+                phi_ct = phi[:, ct_idx]  # → (n_edges,)
                 if self.prior_type == "spike_slab":
-                    ct_weights = edge_probs * (q_dict["tau"][len(quantiles)//2] + phi[ct_idx])
+                    tau_med = q_dict["tau"][len(quantiles)//2]  # shape: (n_edges,)
+                    ct_weights = edge_probs * (tau_med + phi_ct)
                 else:
-                    ct_weights = edge_weights + phi[ct_idx]
+                    ct_weights = edge_weights + phi_ct
                 
                 # Apply same filtering
                 ct_keep = keep_mask  # Could add cell-type specific filtering
