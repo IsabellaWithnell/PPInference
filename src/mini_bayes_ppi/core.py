@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import scipy.sparse as spsp
+import torch
 import pyro
 import pyro.distributions as dist
-import torch
 from pyro.infer import SVI, Trace_ELBO
 from pyro.infer.autoguide import AutoNormal
 from torch.utils.data import DataLoader, TensorDataset
-import scipy.sparse as spsp
+
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -119,10 +120,8 @@ class MBModel:
                    f"{self.n_edges} edges, {self.n_cells} cells")
 
         # Expression data
-        if spsp.issparse(adata.X):
-            X_arr = adata.X.toarray()
-        else:
-            X_arr = adata.X
+        X_arr = adata.X.toarray() if spsp.issparse(adata.X) else adata.X
+
         x = torch.tensor(X_arr, dtype=torch.float32, device=self.device)
         
         self.X = x.to(self.device)
@@ -179,7 +178,6 @@ class MBModel:
             # Cell type-specific modulation
             with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
                 phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
-            phi
             
             # Compute edge weights
             phi_batch = phi[:, ct].T  # Shape: (batch_size, n_edges)
@@ -231,7 +229,7 @@ class MBModel:
         r_expanded = r.unsqueeze(0).expand(batch_size, -1)
         
         # Likelihood
-        counts = x_batch.round().to(torch.int64)
+        counts = xb.round().to(torch.int64)
 
         # batch‐plate over cells
         with pyro.plate("cells", counts.size(0)):
