@@ -9,6 +9,7 @@ import torch
 from pyro.infer import SVI, Trace_ELBO
 from pyro.infer.autoguide import AutoNormal
 from torch.utils.data import DataLoader, TensorDataset
+import scipy.sparse as spsp
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -118,10 +119,12 @@ class MBModel:
                    f"{self.n_edges} edges, {self.n_cells} cells")
 
         # Expression data
-        x = torch.tensor(
-            adata.X.A if hasattr(adata.X, "A") else adata.X, 
-            dtype=torch.float32
-        )
+        if spsp.issparse(adata.X):
+            X_arr = adata.X.toarray()
+        else:
+            X_arr = adata.X
+        x = torch.tensor(X_arr, dtype=torch.float32, device=self.device)
+        
         self.X = x.to(self.device)
 
         # Library size normalization
@@ -165,9 +168,10 @@ class MBModel:
         
         # Edge weights with chosen prior
         if self.prior_type == "spike_slab":
+            temp = torch.tensor(self.z_temperature, device=self.device)
             # Spike-and-slab prior for edge selection
             with pyro.plate("edges_z", self.n_edges):
-                z = pyro.sample("z", dist.RelaxedBernoulli(self.z_temperature, probs=self.edge_prior_prob))
+                z = pyro.sample("z", dist.RelaxedBernoulli(temp, probs=self.edge_prior_prob))
             
             with pyro.plate("edges_tau", self.n_edges):
                 tau = pyro.sample("tau", dist.Normal(0.0, 0.5))
@@ -175,7 +179,7 @@ class MBModel:
             # Cell type-specific modulation
             with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
                 phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
-            phi = phi.T  # Shape: (n_edges, n_types)
+            phi
             
             # Compute edge weights
             phi_batch = phi[:, ct].T  # Shape: (batch_size, n_edges)
