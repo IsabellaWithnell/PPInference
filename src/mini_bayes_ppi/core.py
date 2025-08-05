@@ -166,7 +166,7 @@ class MBModel:
             r = pyro.sample("r", dist.Gamma(2.0, 0.1))
         
         # --- common plates for phi: edges × cell_types → phi (n_edges, n_types) ---
-        with pyro.plate("edges_phi", self.n_edges), pyro.plate("cell_types", self.n_types):
+        with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
             phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
 
         # pick out the cell-type column for each cell and transpose → (batch_size, n_edges)
