@@ -53,7 +53,7 @@ class MBModel:
         lr: float = 5e-3,
         device: str | None = None,
         prior_type: str = "spike_slab",  # New: choice of prior
-        edge_prior_prob: float = 0.1,    # New: customizable prior
+        edge_prior_prob: float = 0.5,    # New: customizable prior
     ) -> None:
         """Initialize the Bayesian PPI inference model.
         
