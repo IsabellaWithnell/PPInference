@@ -37,11 +37,20 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
-"test" = [
-  "pytest-cov",
-  "torch",  # for GPU tests
+test = [
   "pytest>=8.0",
+  "pytest-cov",
+  "torch",
   "ruff>=0.4",
+  "anndata>=0.10",
+  "pandas>=2.0", 
+  "numpy>=1.24",
+  "scipy>=1.11",
+  "pyro-ppl>=1.9",
+]
+docs = [
+  "sphinx",
+  "sphinx-rtd-theme",
 ]
 
 [project.urls]
