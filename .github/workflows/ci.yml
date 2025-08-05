@@ -25,8 +25,17 @@ jobs:
       
       - name: Lint with ruff
         run: |
-          ruff check src/ tests/
-          ruff format --check src/ tests/
+          # Create directories if they don't exist
+          mkdir -p src tests
+          # Only lint if directories exist and contain Python files
+          if [ -d "src" ] && [ "$(find src -name '*.py' | wc -l)" -gt 0 ]; then
+            ruff check src/
+            ruff format --check src/
+          fi
+          if [ -d "tests" ] && [ "$(find tests -name '*.py' | wc -l)" -gt 0 ]; then
+            ruff check tests/
+            ruff format --check tests/
+          fi
 
   test:
     runs-on: ${{ matrix.os }}
@@ -50,21 +59,31 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       
+      - name: Install system dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+      
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
+          # Install build dependencies first
+          pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
+          pip install "pyro-ppl>=1.9"
+          # Then install package in editable mode
           pip install -e ".[test]"
       
       - name: Test with pytest
         run: |
-          pytest tests/ -v --cov=mini_bayes_ppi --cov-report=xml
+          pytest tests/ -v --cov=mini_bayes_ppi --cov-report=xml --tb=short
       
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v4
         with:
           file: ./coverage.xml
-          fail_ci_if_error: true
+          fail_ci_if_error: false  # Don't fail CI if codecov fails
 
   test-gpu:
     runs-on: ubuntu-latest
@@ -75,13 +94,18 @@ jobs:
       
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install -e ".[test]"
       
       - name: Test GPU functionality
         run: |
           python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
-          pytest tests/test_core.py::TestGPUSupport -v
+          # Only run GPU tests if they exist
+          if python -c "import pytest; pytest.main(['--collect-only', 'tests/test_core.py::TestGPUSupport'])" 2>/dev/null; then
+            pytest tests/test_core.py::TestGPUSupport -v
+          else
+            echo "No GPU tests found, skipping"
+          fi
 
   test-notebooks:
     runs-on: ubuntu-latest
@@ -95,13 +119,19 @@ jobs:
       
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
+          pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[test]"
           pip install nbval jupyter
       
       - name: Test notebooks
         run: |
-          pytest --nbval-lax docs/notebooks/ || echo "No notebooks to test"
+          # Only test notebooks if they exist
+          if [ -d "docs/notebooks" ] && [ "$(find docs/notebooks -name '*.ipynb' | wc -l)" -gt 0 ]; then
+            pytest --nbval-lax docs/notebooks/
+          else
+            echo "No notebooks found to test"
+          fi
 
   build:
     runs-on: ubuntu-latest
@@ -115,7 +145,7 @@ jobs:
       
       - name: Install build tools
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
           pip install build twine
       
       - name: Build distribution
@@ -125,10 +155,10 @@ jobs:
         run: |
           twine check dist/*
           # Check that the package size is reasonable
-          find dist -name "*.whl" -size +10M -exec echo "Warning: Wheel {} is larger than 10MB" {} \;
+          find dist -name "*.whl" -size +10M -exec echo "Warning: Wheel {} is larger than 10MB" {} \; || true
       
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
@@ -147,7 +177,7 @@ jobs:
           python-version: '3.11'
       
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
@@ -155,6 +185,8 @@ jobs:
       - name: Install from wheel
         run: |
           python -m pip install --upgrade pip
+          # Install PyTorch first to avoid dependency conflicts
+          pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
           pip install dist/*.whl
       
       - name: Test import
@@ -174,12 +206,21 @@ jobs:
       
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools wheel
+          pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[docs]" || pip install -e .
           pip install sphinx sphinx-rtd-theme
       
       - name: Build documentation
         run: |
-          cd docs || mkdir docs
-          sphinx-quickstart -q -p "mini_bayes_ppi" -a "Isabella Withnell" --ext-autodoc --ext-napoleon --makefile || echo "Docs not set up"
-          make html || echo "No documentation to build"
+          if [ -d "docs" ]; then
+            cd docs
+            if [ -f "conf.py" ]; then
+              make html || sphinx-build -b html . _build/html
+            else
+              sphinx-quickstart -q -p "mini_bayes_ppi" -a "Isabella Withnell" --ext-autodoc --ext-napoleon --makefile
+              make html || echo "Documentation setup needed"
+            fi
+          else
+            echo "No documentation directory found"
+          fi
