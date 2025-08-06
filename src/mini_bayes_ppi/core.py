@@ -541,7 +541,15 @@ class MBModel:
             "reliability": self.gene_reliability.cpu().numpy(),
         })
 
-
+def debug_training(self):
+    """Add this method to MBModel to diagnose issues."""
+    q_dict = self.guide.quantiles([0.5])
+    if self.prior_type == "spike_slab":
+        z_values = q_dict["z"][0]
+        print(f"Edge probabilities: min={z_values.min():.4f}, "
+              f"max={z_values.max():.4f}, mean={z_values.mean():.4f}")
+        print(f"Edges > 0.5: {(z_values > 0.5).sum()}")
+        
 def export_networks(model: MBModel, threshold: float = 0.5, **kwargs):
     """Export networks from a fitted model.
     
