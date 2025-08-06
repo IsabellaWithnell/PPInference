@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import numpy as np
 import scipy.sparse as spsp
 import torch
 import pyro
@@ -52,8 +53,10 @@ class MBModel:
         temp: float = 1,
         lr: float = 5e-3,
         device: str | None = None,
-        prior_type: str = "spike_slab",  # New: choice of prior
-        edge_prior_prob: float = 0.5,    # New: customizable prior
+        prior_type: str = "spike_slab",
+        edge_prior_prob: float = 0.5,
+        coverage_weight_type: str = "adaptive",  # New parameter
+        min_coverage: float = 1.0,  # New parameter
     ) -> None:
         """Initialize the Bayesian PPI inference model.
         
@@ -75,6 +78,12 @@ class MBModel:
             Type of prior: 'spike_slab' or 'horseshoe'
         edge_prior_prob : float
             Prior probability of edge existence (for spike-slab)
+        coverage_weight_type : str
+            'adaptive': Weight by gene coverage
+            'binary': Threshold-based inclusion
+            'none': No coverage weighting
+        min_coverage : float
+            Minimum mean expression for gene inclusion
         """
         # Device setup
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -93,7 +102,9 @@ class MBModel:
         self.lr = lr
         self.prior_type = prior_type
         self.edge_prior_prob = edge_prior_prob
-        self.z_temperature   = temp
+        self.z_temperature = temp
+        self.coverage_weight_type = coverage_weight_type
+        self.min_coverage = min_coverage
 
         # Gene information
         self.genes: list[str] = list(adata.var_names)
@@ -121,14 +132,15 @@ class MBModel:
 
         # Expression data
         X_arr = adata.X.toarray() if spsp.issparse(adata.X) else adata.X
-
         x = torch.tensor(X_arr, dtype=torch.float32, device=self.device)
-        
         self.X = x.to(self.device)
 
         # Library size normalization
         libsize = torch.sum(self.X, dim=1, keepdim=True) + 1.0
         self.log_lib = libsize.log()
+        
+        # Calculate gene-level statistics for coverage weighting
+        self._calculate_gene_stats()
 
         # Create data loader
         dataset = TensorDataset(self.X, self.ct_idx, self.log_lib)
@@ -138,89 +150,179 @@ class MBModel:
             shuffle=True,
             drop_last=False,
             pin_memory=(self.device.type == "cuda"),
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues
+            num_workers=0,
         )
 
         self._build_model()
+    
+    def _calculate_gene_stats(self):
+        """Calculate coverage and reliability metrics per gene."""
+        X_cpu = self.X.cpu().numpy()
+        
+        # Mean expression (coverage proxy)
+        self.gene_mean = torch.tensor(
+            np.mean(X_cpu, axis=0), 
+            device=self.device, 
+            dtype=torch.float32
+        )
+        
+        # Fraction of zero expression (dropout rate)
+        self.gene_dropout = torch.tensor(
+            np.mean(X_cpu == 0, axis=0),
+            device=self.device,
+            dtype=torch.float32
+        )
+        
+        # Coefficient of variation (noise level)
+        gene_std = np.std(X_cpu, axis=0)
+        gene_cv = np.divide(
+            gene_std, 
+            self.gene_mean.cpu().numpy() + 1e-6,
+            out=np.ones_like(gene_std),
+            where=self.gene_mean.cpu().numpy() > 0
+        )
+        self.gene_cv = torch.tensor(gene_cv, device=self.device, dtype=torch.float32)
+        
+        # Composite reliability score (higher = more reliable)
+        self.gene_reliability = self._compute_reliability_score()
+        
+        # Log statistics
+        logger.info(f"Gene coverage stats:")
+        logger.info(f"  Mean expression: {self.gene_mean.mean():.2f} (±{self.gene_mean.std():.2f})")
+        logger.info(f"  Mean dropout: {self.gene_dropout.mean():.2%}")
+        logger.info(f"  Genes below min_coverage: {(self.gene_mean < self.min_coverage).sum()}")
+    
+    def _compute_reliability_score(self):
+        """Compute composite reliability score for each gene."""
+        # Normalize each metric to [0, 1]
+        coverage_score = torch.log1p(self.gene_mean) / (torch.log1p(self.gene_mean.max()) + 1e-6)
+        dropout_penalty = 1 - self.gene_dropout
+        cv_penalty = 1 / (1 + self.gene_cv)
+        
+        # Weighted combination
+        reliability = (
+            0.5 * coverage_score +
+            0.3 * dropout_penalty + 
+            0.2 * cv_penalty
+        )
+        
+        return reliability
 
     def _model(self, xs: torch.Tensor, ct: torch.Tensor, log_lib: torch.Tensor) -> None:
-        """Bayesian generative model for PPI inference.
-        
-        Parameters
-        ----------
-        xs : torch.Tensor
-            Gene expression counts (batch_size, n_genes)
-        ct : torch.Tensor
-            Cell type indices (batch_size,)
-        log_lib : torch.Tensor
-            Log library size (batch_size, 1)
-        """
+        """Bayesian generative model for PPI inference with coverage weighting."""
         batch_size = xs.shape[0]
         
         # Gene-specific baseline expression
         with pyro.plate("genes_bias", self.n_genes):
             bias = pyro.sample("bias", dist.Normal(0.0, 1.0))
         
-        # Negative binomial dispersion (inverse dispersion)
+        # Coverage-adjusted dispersion
         with pyro.plate("genes_r", self.n_genes):
-            r = pyro.sample("r", dist.Gamma(2.0, 0.1))
+            if self.coverage_weight_type == "adaptive":
+                # Scale dispersion by reliability
+                r_scale = 0.5 + 1.5 * self.gene_reliability
+                r = pyro.sample("r", dist.Gamma(2.0 * r_scale, 0.1))
+            else:
+                r = pyro.sample("r", dist.Gamma(2.0, 0.1))
         
-        # --- common plates for phi: edges × cell_types → phi (n_edges, n_types) ---
+        # Edge interactions
         with pyro.plate("cell_types", self.n_types), pyro.plate("edges_phi", self.n_edges):
             phi = pyro.sample("phi", dist.Normal(0.0, 0.2))
 
-        # pick out the cell-type column for each cell and transpose → (batch_size, n_edges)
         phi_batch = phi[:, ct].T
 
         if self.prior_type == "spike_slab":
             temp = torch.tensor(self.z_temperature, device=self.device)
+            
+            # Coverage-weighted edge probabilities
+            if self.coverage_weight_type == "adaptive":
+                i, j = self.edge_idx
+                edge_coverage_weight = torch.sqrt(
+                    self.gene_reliability[i] * self.gene_reliability[j]
+                )
+                edge_prior = self.edge_prior_prob * (0.5 + 0.5 * edge_coverage_weight)
+            else:
+                edge_prior = self.edge_prior_prob
+            
             with pyro.plate("edges_z", self.n_edges):
-                z = pyro.sample("z", dist.RelaxedBernoulli(temp, probs=self.edge_prior_prob))
+                z = pyro.sample("z", dist.RelaxedBernoulli(temp, probs=edge_prior))
+            
             with pyro.plate("edges_tau", self.n_edges):
-                tau = pyro.sample("tau", dist.Normal(0.0, 0.5))
-            # spike-and-slab interaction
+                if self.coverage_weight_type == "adaptive":
+                    tau_scale = 0.5 * (0.5 + 0.5 * edge_coverage_weight)
+                else:
+                    tau_scale = 0.5
+                tau = pyro.sample("tau", dist.Normal(0.0, tau_scale))
+            
             W_edges = z * (tau + phi_batch)
-        else:
-            # horseshoe
+        else:  # horseshoe
             tau_global = pyro.sample("tau_global", dist.HalfCauchy(1.0))
+            
             with pyro.plate("edges_local", self.n_edges):
-                tau_local = pyro.sample("tau_local", dist.HalfCauchy(1.0))
+                if self.coverage_weight_type == "adaptive":
+                    i, j = self.edge_idx
+                    edge_coverage_weight = torch.sqrt(
+                        self.gene_reliability[i] * self.gene_reliability[j]
+                    )
+                    tau_local = pyro.sample(
+                        "tau_local", 
+                        dist.HalfCauchy(1.0 / (0.5 + 0.5 * edge_coverage_weight))
+                    )
+                else:
+                    tau_local = pyro.sample("tau_local", dist.HalfCauchy(1.0))
+            
             with pyro.plate("edges_w", self.n_edges):
                 w = pyro.sample("w", dist.Normal(0.0, 1.0))
+            
             base_weight = tau_global * tau_local * w
             W_edges = base_weight + phi_batch
         
-        # Apply edge interactions efficiently
+        # Apply edge interactions
         i, j = self.edge_idx
-        
-        # Numerical stability: clamp expression values
         xs_clamped = torch.clamp(xs, min=0, max=1e4)
         
+        if self.coverage_weight_type == "binary":
+            # Mask out low-coverage genes
+            coverage_mask = (self.gene_mean > self.min_coverage).float()
+            xs_masked = xs_clamped * coverage_mask.unsqueeze(0)
+        else:
+            xs_masked = xs_clamped
+        
         # Compute interaction effects
-        interaction_effects_i = xs_clamped[:, j] * W_edges  # Gene j -> Gene i
-        interaction_effects_j = xs_clamped[:, i] * W_edges  # Gene i -> Gene j
+        interaction_effects_i = xs_masked[:, j] * W_edges
+        interaction_effects_j = xs_masked[:, i] * W_edges
         
         # Accumulate effects
         Wx = torch.zeros_like(xs)
         Wx.scatter_add_(1, i.unsqueeze(0).expand(batch_size, -1), interaction_effects_i)
         Wx.scatter_add_(1, j.unsqueeze(0).expand(batch_size, -1), interaction_effects_j)
         
-        # Numerical stability: clamp interaction effects
+        # Numerical stability
         Wx = torch.clamp(Wx, min=-10, max=10)
-        
-        # Compute log rates with stability
         logits = log_lib + bias + Wx
-        logits = torch.clamp(logits, min=-20, max=20)  # Prevent overflow
+        logits = torch.clamp(logits, min=-20, max=20)
         
-        # Likelihood
+        # Likelihood with coverage-based confidence
         counts = xs.round().to(torch.int64)
-        with pyro.plate("cells", counts.size(0)):
-            pyro.sample(
-                "obs",
-                dist.NegativeBinomial(total_count=r, logits=logits).to_event(1),
-                obs=counts,
-            )
-
+        
+        if self.coverage_weight_type == "adaptive":
+            # Scale dispersion by reliability
+            with pyro.plate("cells", counts.size(0)):
+                pyro.sample(
+                    "obs",
+                    dist.NegativeBinomial(
+                        total_count=r * self.gene_reliability,
+                        logits=logits
+                    ).to_event(1),
+                    obs=counts,
+                )
+        else:
+            with pyro.plate("cells", counts.size(0)):
+                pyro.sample(
+                    "obs",
+                    dist.NegativeBinomial(total_count=r, logits=logits).to_event(1),
+                    obs=counts,
+                )
 
     def _build_model(self) -> None:
         """Build the model and inference components."""
@@ -242,28 +344,7 @@ class MBModel:
         patience: int = 50,
         min_delta: float = 1e-4,
     ) -> dict:
-        """Fit the model using stochastic variational inference.
-        
-        Parameters
-        ----------
-        epochs : int
-            Maximum number of training epochs
-        lr : float or None
-            Learning rate (updates the optimizer if provided)
-        verbose : bool
-            Whether to print training progress
-        log_interval : int
-            Epochs between progress updates
-        patience : int
-            Early stopping patience (epochs without improvement)
-        min_delta : float
-            Minimum change in loss for early stopping
-            
-        Returns
-        -------
-        dict
-            Training history with 'loss' key
-        """
+        """Fit the model using stochastic variational inference."""
         if lr is not None:
             self.lr = lr
             self._build_model()
@@ -308,26 +389,10 @@ class MBModel:
         threshold: float = 0.5,
         return_cell_type_specific: bool = False,
         include_confidence: bool = True,
+        include_reliability: bool = True,  # New parameter
         quantiles: list[float] | None = None,
     ) -> pd.DataFrame | dict[str, pd.DataFrame]:
-        """Export inferred PPI networks.
-        
-        Parameters
-        ----------
-        threshold : float
-            Probability threshold for edge inclusion (spike-slab only)
-        return_cell_type_specific : bool
-            If True, return cell-type specific networks
-        include_confidence : bool
-            If True, include confidence intervals
-        quantiles : list[float] or None
-            Quantiles to compute for confidence intervals
-            
-        Returns
-        -------
-        pd.DataFrame or dict[str, pd.DataFrame]
-            Network edges with probabilities and weights
-        """
+        """Export inferred PPI networks with reliability scores."""
         import pandas as pd
         
         if quantiles is None:
@@ -338,8 +403,8 @@ class MBModel:
         
         if self.prior_type == "spike_slab":
             # Extract edge probabilities
-            z_samples = q_dict["z"]  # Shape: (n_quantiles, n_edges)
-            edge_probs = z_samples[len(quantiles)//2]  # Median
+            z_samples = q_dict["z"]
+            edge_probs = z_samples[len(quantiles)//2]
             
             # Filter by threshold
             keep_mask = edge_probs >= threshold
@@ -382,24 +447,32 @@ class MBModel:
                 result_data["weight_lower"] = q_dict["tau"][0][keep_mask].cpu().numpy()
                 result_data["weight_upper"] = q_dict["tau"][-1][keep_mask].cpu().numpy()
             
+            # Add reliability scores
+            if include_reliability and self.coverage_weight_type != "none":
+                gene_i_rel = [float(self.gene_reliability[i]) for i in i_indices]
+                gene_j_rel = [float(self.gene_reliability[j]) for j in j_indices]
+                result_data["gene_i_reliability"] = gene_i_rel
+                result_data["gene_j_reliability"] = gene_j_rel
+                result_data["edge_reliability"] = np.sqrt(
+                    np.array(gene_i_rel) * np.array(gene_j_rel)
+                )
+            
             return pd.DataFrame(result_data)
         
         else:
             # Cell-type specific networks
             networks = {}
-            phi = q_dict["phi"][len(quantiles)//2]  # median → (n_edges, n_types)
+            phi = q_dict["phi"][len(quantiles)//2]
             
             for ct_idx, ct_name in enumerate(self.ctypes):
-                # select the ct_idx column out of the (n_edges, n_types) matrix
-                phi_ct = phi[:, ct_idx]  # → (n_edges,)
+                phi_ct = phi[:, ct_idx]
                 if self.prior_type == "spike_slab":
-                    tau_med = q_dict["tau"][len(quantiles)//2]  # shape: (n_edges,)
+                    tau_med = q_dict["tau"][len(quantiles)//2]
                     ct_weights = edge_probs * (tau_med + phi_ct)
                 else:
                     ct_weights = edge_weights + phi_ct
                 
-                # Apply same filtering
-                ct_keep = keep_mask  # Could add cell-type specific filtering
+                ct_keep = keep_mask
                 
                 i_indices = self.edge_idx[0, ct_keep].cpu().numpy()
                 j_indices = self.edge_idx[1, ct_keep].cpu().numpy()
@@ -413,6 +486,16 @@ class MBModel:
                 if self.prior_type == "spike_slab":
                     ct_data["probability"] = edge_probs[ct_keep].cpu().numpy()
                 
+                # Add reliability scores
+                if include_reliability and self.coverage_weight_type != "none":
+                    gene_i_rel = [float(self.gene_reliability[i]) for i in i_indices]
+                    gene_j_rel = [float(self.gene_reliability[j]) for j in j_indices]
+                    ct_data["gene_i_reliability"] = gene_i_rel
+                    ct_data["gene_j_reliability"] = gene_j_rel
+                    ct_data["edge_reliability"] = np.sqrt(
+                        np.array(gene_i_rel) * np.array(gene_j_rel)
+                    )
+                
                 networks[ct_name] = pd.DataFrame(ct_data)
             
             return networks
@@ -422,37 +505,19 @@ class MBModel:
         cell_types: torch.Tensor | None = None,
         n_samples: int = 100,
     ) -> torch.Tensor:
-        """Generate expression predictions from the fitted model.
-        
-        Parameters
-        ----------
-        cell_types : torch.Tensor or None
-            Cell type indices for prediction
-        n_samples : int
-            Number of samples to generate
-            
-        Returns
-        -------
-        torch.Tensor
-            Predicted expression matrix
-        """
+        """Generate expression predictions from the fitted model."""
         if cell_types is None:
-            # Sample random cell types
             cell_types = torch.randint(0, self.n_types, (n_samples,), device=self.device)
         
-        # Use the guide to sample from posterior
         with torch.no_grad():
-            # Sample library sizes from training data
             lib_sizes = torch.exp(self.log_lib[torch.randint(0, len(self.log_lib), (n_samples, 1))])
             
-            # Generate predictions
             trace = pyro.poutine.trace(self.guide).get_trace(
                 torch.zeros(n_samples, self.n_genes, device=self.device),
                 cell_types,
                 lib_sizes.log()
             )
             
-            # Run model with sampled parameters
             conditioned_model = pyro.poutine.replay(self._model, trace)
             
             with pyro.plate("prediction", n_samples):
@@ -463,23 +528,23 @@ class MBModel:
                 )
             
             return trace.nodes["obs"]["value"]
+    
+    def get_gene_stats(self) -> pd.DataFrame:
+        """Return gene-level statistics as a DataFrame."""
+        import pandas as pd
+        
+        return pd.DataFrame({
+            "gene": self.genes,
+            "mean_expression": self.gene_mean.cpu().numpy(),
+            "dropout_rate": self.gene_dropout.cpu().numpy(),
+            "cv": self.gene_cv.cpu().numpy(),
+            "reliability": self.gene_reliability.cpu().numpy(),
+        })
 
 
 def export_networks(model: MBModel, threshold: float = 0.5, **kwargs):
-    """Export networks from a fitted model.
-    
-    Parameters
-    ----------
-    model : MBModel
-        Fitted model instance
-    threshold : float
-        Probability threshold for edge inclusion
-    **kwargs
-        Additional arguments passed to model.export_networks()
-        
-    Returns
-    -------
-    pd.DataFrame or dict
+    """Export networks from a fitted model."""
+    return model.export_networks(threshold, **kwargs)or dict
         Exported networks
     """
     return model.export_networks(threshold, **kwargs)
