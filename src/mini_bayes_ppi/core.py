@@ -543,8 +543,20 @@ class MBModel:
 
 
 def export_networks(model: MBModel, threshold: float = 0.5, **kwargs):
-    """Export networks from a fitted model."""
-    return model.export_networks(threshold, **kwargs)or dict
+    """Export networks from a fitted model.
+    
+    Parameters
+    ----------
+    model : MBModel
+        Fitted model instance
+    threshold : float
+        Probability threshold for edge inclusion
+    **kwargs
+        Additional arguments passed to model.export_networks()
+        
+    Returns
+    -------
+    pd.DataFrame or dict
         Exported networks
     """
     return model.export_networks(threshold, **kwargs)
